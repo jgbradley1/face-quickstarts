@@ -7,6 +7,11 @@ import torchvision
 from torchvision import transforms
 from torch.optim.lr_scheduler import StepLR
 
+import ignite.engine
+from ignite.engine import Events
+import ignite.metrics
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 class Net(nn.Module):
     def __init__(self):
@@ -44,7 +49,9 @@ def train(args, model, device, train_loader, optimizer, epoch):
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
+                epoch,
+                batch_idx * len(data),
+                len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
@@ -63,7 +70,9 @@ def test(args, model, device, test_loader):
     test_loss /= len(test_loader.dataset)
 
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
+        test_loss,
+        correct,
+        len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
 
@@ -78,8 +87,8 @@ def main():
                         help='number of epochs to train (default: 5)')
     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
                         help='Learning rate step gamma (default: 0.7)')
-    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                        help='how many batches to wait before logging training status')
+    parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+                        help='how many batches to wait before logging training status (default: 50)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
     parser.add_argument('--save-model', action='store_true', default=False,
@@ -122,15 +131,57 @@ def main():
     model = Net().to(device)
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
-    # training loop
-    scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, optimizer, epoch)
-        test(args, model, device, test_loader)
-        scheduler.step()
+    # setup ignite
+    trainer = ignite.engine.create_supervised_trainer(model, optimizer, F.nll_loss, device=str(device))
+    evaluator = ignite.engine.create_supervised_evaluator(
+        model,
+        metrics={"accuracy": ignite.metrics.Accuracy(),
+                 "nll": ignite.metrics.Loss(F.nll_loss)},
+        device=str(device))
+    desc = "ITERATION - loss: {:.2f}"
+    pbar = tqdm(initial=0, leave=False, total=len(train_loader), desc=desc.format(0))
+
+    # setup tensorboard
+    # writer will output to ./runs/ directory by default
+    writer = SummaryWriter()
+
+    @trainer.on(Events.ITERATION_COMPLETED(every=args.log_interval))
+    def log_training_loss(engine):
+        pbar.desc = desc.format(engine.state.output)
+        pbar.update(args.log_interval)
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def log_training_results(engine):
+        pbar.refresh()
+        evaluator.run(train_loader)
+        metrics = evaluator.state.metrics
+        avg_accuracy = metrics["accuracy"]
+        avg_nll = metrics["nll"]
+        writer.add_scalar('Loss/train', avg_nll, engine.state.epoch)
+        writer.add_scalar('Accuracy/train', avg_accuracy, engine.state.epoch)
+        tqdm.write(
+            "Training Results   - Epoch: {}  Avg accuracy: {:.2f} Avg loss: {:.2f}".format(
+                engine.state.epoch, avg_accuracy, avg_nll))
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def log_validation_results(engine):
+        evaluator.run(test_loader)
+        metrics = evaluator.state.metrics
+        avg_accuracy = metrics["accuracy"]
+        avg_nll = metrics["nll"]
+        writer.add_scalar('Loss/test', avg_nll, engine.state.epoch)
+        writer.add_scalar('Accuracy/test', avg_accuracy, engine.state.epoch)
+        tqdm.write(
+            "Validation Results - Epoch: {}  Avg accuracy: {:.2f} Avg loss: {:.2f}".format(
+                engine.state.epoch, avg_accuracy, avg_nll))
+        pbar.n = pbar.last_print_n = 0
+
+    trainer.run(train_loader, max_epochs=args.epochs)
+    pbar.close()
+    writer.close()
 
     if args.save_model:
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+        torch.save(trainer.state_dict(), "mnist_cnn.pt")
 
     print("Done")
 
